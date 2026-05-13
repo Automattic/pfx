@@ -1,0 +1,2 @@
+EXTRA_LDFLAGS="$EXTRA_LDFLAGS -lcurl"
+PHP_NEW_EXTENSION(pfx, pfx.c, shared)
