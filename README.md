@@ -47,11 +47,15 @@ values give finer-grained profiles at the cost of more sampling overhead and
 a larger output file size. Note that some systems do not support clock
 resolution lower than 1 ms.
 
+An optional `pfx.max_size` can be set to limit the output file size, which
+aborts with a warning when the size is reached.
+
 Below is an example configuration:
 
     pfx.endpoint=http://127.0.0.1:8080
     pfx.timeout=25
     pfx.period=1
+    pfx.max_size=1m
 
 Enabling the extension does not automatically enable profiling. This has to be
 done separately from PHP.

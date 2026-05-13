@@ -29,6 +29,8 @@
 // 0x200 range: transform flags, OR'd with an arg position.
 #define PFX_META_NORMALIZE_SQL 0x200 // Normalize a SQL string before storing
 
+static void pfx_stop(void);
+
 
 // ============================================================================
 // Types
@@ -73,6 +75,9 @@ static uint32_t pfx_cap_frames;
 static HashTable pfx_frame_dedup;    // pfx_key bytes -> frame index
 static HashTable pfx_sample_counts;  // leaf frame idx -> u32* count
 
+static uint64_t pfx_out_bytes;
+static uint64_t pfx_max_bytes;
+
 static pthread_t pfx_tick_thread;
 static int pfx_timerfd = -1;
 static _Atomic uint32_t pfx_ticks;
@@ -110,6 +115,7 @@ static zend_string* pfx_meta_string(const char* buf, size_t len) {
   s = zend_string_init(buf, len, 1);
   zend_hash_add_new_ptr(&pfx_meta_strings, s, s);
   zend_string_release(s);
+  pfx_out_bytes += sizeof(uint32_t) + len;  // len prefix + bytes
   return s;
 }
 
@@ -328,6 +334,7 @@ static uint32_t add_frame(zend_function* fn, zend_string* meta, uint32_t prev) {
       &pfx_frame_dedup, (const char*)&key, sizeof(key),
       (void*)(uintptr_t)new_idx);
 
+  pfx_out_bytes += sizeof(pfx_out_frame);
   return new_idx;
 }
 
@@ -347,6 +354,7 @@ static void record_sample(uint32_t leaf, uint32_t count) {
     c = pemalloc(sizeof(*c), 1);
     *c = 0;
     zend_hash_index_add_ptr(&pfx_sample_counts, (zend_ulong)leaf, c);
+    pfx_out_bytes += sizeof(uint32_t) + sizeof(uint32_t);  // leaf + count
   }
   *c += count;
 }
@@ -387,6 +395,13 @@ static void pfx_interrupt_fn(zend_execute_data* ex) {
       uint32_t leaf = build_chain(ex, 0);
       if (leaf) {
         record_sample(leaf, n);
+      }
+      if (pfx_max_bytes && pfx_out_bytes > pfx_max_bytes) {
+        pfx_stop();
+        pfx_aborted = true;
+        php_error_docref(NULL, E_WARNING,
+          "pfx: profile exceeded pfx.max_size (%llu bytes); aborted",
+          (unsigned long long)pfx_max_bytes);
       }
     }
   }
@@ -439,6 +454,7 @@ static void pfx_init_state(void) {
   pfx_frames = NULL;
   pfx_n_frames = 0;
   pfx_cap_frames = 0;
+  pfx_out_bytes = 0;
 
   zend_hash_init(&pfx_frame_dedup, 256, NULL, NULL, 1);
   zend_hash_init(&pfx_sample_counts, 256, NULL, pfx_count_dtor, 1);
@@ -584,7 +600,16 @@ static bool emit_binary(FILE* out) {
 
   // ferror() catches any short write or stream error from any fwrite above,
   // including memstream realloc failures.
-  return ferror(out) == 0;
+  if (ferror(out)) return false;
+
+  long written = ftell(out);
+  if (pfx_max_bytes && written > 0 && (uint64_t)written > pfx_max_bytes) {
+    php_error_docref(NULL, E_WARNING,
+      "pfx: profile (%ld bytes) exceeds pfx.max_size (%llu); discarded",
+      written, (unsigned long long)pfx_max_bytes);
+    return false;
+  }
+  return true;
 }
 
 
@@ -647,6 +672,18 @@ PHP_FUNCTION(pfx_start) {
   }
 
   pfx_period_ns = (uint64_t)(period_ms * 1000000.0);
+
+  pfx_max_bytes = 0;
+  const char* m = INI_STR("pfx.max_size");
+  if (m && *m) {
+    char* end;
+    long long v = strtoll(m, &end, 10);
+    if (v > 0) {
+      if (*end == 'K' || *end == 'k') v *= 1024;
+      else if (*end == 'M' || *end == 'm') v *= 1024 * 1024;
+      pfx_max_bytes = (uint64_t)v;
+    }
+  }
 
   pfx_init_state();
 
@@ -798,6 +835,7 @@ PHP_INI_BEGIN()
   PHP_INI_ENTRY("pfx.timeout", "25", PHP_INI_SYSTEM, NULL)
   PHP_INI_ENTRY("pfx.period", "1", PHP_INI_SYSTEM, NULL)
   PHP_INI_ENTRY("pfx.secret", "", PHP_INI_SYSTEM, NULL)
+  PHP_INI_ENTRY("pfx.max_size", "0", PHP_INI_SYSTEM, NULL)
 PHP_INI_END()
 
 // Helper cb to silence libcurl output.
