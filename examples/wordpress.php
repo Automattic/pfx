@@ -5,6 +5,10 @@ function __pfx_init() {
 	}
 
 	pfx_set( 'timestamp', time() );
+	pfx_set( 'http_host', $_SERVER['HTTP_HOST'] ?? '' );
+	pfx_set( 'request_uri', $_SERVER['REQUEST_URI'] ?? '' );
+	pfx_set( 'request_method', $_SERVER['REQUEST_METHOD'] ?? '' );
+	pfx_set( 'request_id', uniqid() );
 
 	// Inherit from caller WP_Hook's inner dispatch
 	pfx_meta( 'WP_Hook::apply_filters', PFX_META_INHERIT );
@@ -23,7 +27,7 @@ function __pfx_init() {
 	pfx_meta( 'wpdb::get_col', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
 	pfx_meta( 'wpdb::get_row', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
 	pfx_meta( 'wpdb::get_var', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
-	pfx_meta( 'mysqli_query', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
+	pfx_meta( 'mysqli_query', PFX_META_SECOND_ARG | PFX_META_NORMALIZE_SQL );
 	pfx_meta( 'QM_DB::query', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
 
 	// HTTP
@@ -49,9 +53,6 @@ function __pfx_init() {
 		pfx_set( 'php_version', phpversion() );
 		pfx_set( 'peak_memory', memory_get_peak_usage( true ) );
 
-		pfx_set( 'http_host', $_SERVER['HTTP_HOST'] ?? '' );
-		pfx_set( 'request_uri', $_SERVER['REQUEST_URI'] ?? '' );
-		pfx_set( 'request_method', $_SERVER['REQUEST_METHOD'] ?? '' );
 		pfx_set( 'user_agent', $_SERVER['HTTP_USER_AGENT'] ?? '' );
 
 		$user = wp_get_current_user();
