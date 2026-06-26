@@ -76,16 +76,16 @@ configured endpoint, unless aborted using `pfx_abort()`.
 
 ## Function metadata
 
-Use `pfx_meta()` to register a function or method (`Class::method` format)
+Use `pfx_capture()` to register a function or method (`Class::method` format)
 whose frames should carry extra metadata in the profile, so you can tell
 otherwise-identical frames apart. For example, attaching the first argument of
 `apply_filters()` in WordPress splits that frame by the filter name (`init`,
 `the_content`, etc.) instead of collapsing everything into one `apply_filters`
 entry:
 
-    pfx_meta( 'apply_filters' );
+    pfx_capture( 'apply_filters' );
 
-By default, `pfx_meta()` will capture the first argument if it's a string. This
+By default, `pfx_capture()` will capture the first argument if it's a string. This
 behavior can be changed using different modes:
 
 * `PFX_META_FIRST_ARG` (default) uses `$args[0]` if it is a string.
@@ -96,7 +96,7 @@ behavior can be changed using different modes:
 
 Examples:
 
-    pfx_meta( 'WP_Hook::do_action', PFX_META_INHERIT );
+    pfx_capture( 'WP_Hook::do_action', PFX_META_INHERIT );
 
 Some of these can be combined with transform flags to further alter the
 resulting frame metadata:
@@ -105,10 +105,10 @@ resulting frame metadata:
 
 Normalize example:
 
-    pfx_meta( 'wpdb::query', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
+    pfx_capture( 'wpdb::query', PFX_META_FIRST_ARG | PFX_META_NORMALIZE_SQL );
 
-You can call `pfx_meta()` at any time during the request, however it is
-recommended to run all `pfx_meta()` registration before running `pfx_start()`.
+You can call `pfx_capture()` at any time during the request, however it is
+recommended to run all `pfx_capture()` registration before running `pfx_start()`.
 The functions do not have to be defined (or even exist) for metadata-capture
 registration.
 
