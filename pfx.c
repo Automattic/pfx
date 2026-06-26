@@ -87,9 +87,9 @@ static uint64_t pfx_period_ns;
 static bool pfx_initialized;
 static bool pfx_aborted;
 
-static HashTable pfx_meta_fns;      // fn_name -> meta_arg (PFX_META_*)
-static HashTable pfx_meta_methods;  // class_name -> (fn_name -> meta_arg)
-static HashTable pfx_meta_strings;  // string -> string for new meta strings
+static HashTable pfx_capture_fns;      // fn_name -> capture rule (PFX_META_*)
+static HashTable pfx_capture_methods;  // class_name -> (fn_name -> capture rule)
+static HashTable pfx_meta_strings;     // string -> string for interned meta strings
 
 static HashTable pfx_request_data;  // key -> value strings set via pfx_set()
 
@@ -187,13 +187,13 @@ static zend_string* frame_meta(zend_execute_data* ex, zend_string* parent_meta) 
   zend_class_entry* scope = fn->common.scope;
   void* p;
   if (scope) {
-    HashTable* inner = zend_hash_find_ptr(&pfx_meta_methods, scope->name);
+    HashTable* inner = zend_hash_find_ptr(&pfx_capture_methods, scope->name);
     if (!inner) {
       return NULL;
     }
     p = zend_hash_find_ptr(inner, fn->common.function_name);
   } else {
-    p = zend_hash_find_ptr(&pfx_meta_fns, fn->common.function_name);
+    p = zend_hash_find_ptr(&pfx_capture_fns, fn->common.function_name);
   }
   if (!p) {
     return NULL;
@@ -430,7 +430,7 @@ static void pfx_count_dtor(zval* z) {
   pefree(Z_PTR_P(z), 1);
 }
 
-static void pfx_meta_methods_dtor(zval* z) {
+static void pfx_capture_methods_dtor(zval* z) {
   HashTable* ht = Z_PTR_P(z);
   zend_hash_destroy(ht);
   pefree(ht, 1);
@@ -626,7 +626,7 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_abort, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_meta, 0, 1, IS_VOID, 0)
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_capture, 0, 1, IS_VOID, 0)
   ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
   ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, meta_arg, IS_LONG, 0, "1")
 ZEND_END_ARG_INFO()
@@ -726,7 +726,7 @@ PHP_FUNCTION(pfx_abort) {
   pfx_aborted = true;
 }
 
-PHP_FUNCTION(pfx_meta) {
+PHP_FUNCTION(pfx_capture) {
   zend_string* name;
   zend_long meta_arg = PFX_META_FIRST_ARG;
 
@@ -751,7 +751,7 @@ PHP_FUNCTION(pfx_meta) {
     php_error_docref(
       NULL,
       E_WARNING,
-      "pfx_meta: meta_arg must be PFX_META_* (got %ld)",
+      "pfx_capture: meta_arg must be PFX_META_* (got %ld)",
       (long)meta_arg
     );
     return;
@@ -772,25 +772,25 @@ PHP_FUNCTION(pfx_meta) {
       php_error_docref(
         NULL,
         E_WARNING,
-        "pfx_meta: name must be 'Class::method' with non-empty parts (got %s)",
+        "pfx_capture: name must be 'Class::method' with non-empty parts (got %s)",
         ZSTR_VAL(name)
       );
       return;
     }
 
-    HashTable* inner = zend_hash_str_find_ptr(&pfx_meta_methods, val, class_len);
+    HashTable* inner = zend_hash_str_find_ptr(&pfx_capture_methods, val, class_len);
     if (!inner) {
       inner = pemalloc(sizeof(HashTable), 1);
       zend_hash_init(inner, 8, NULL, NULL, 1);
-      zend_hash_str_add_ptr(&pfx_meta_methods, val, class_len, inner);
+      zend_hash_str_add_ptr(&pfx_capture_methods, val, class_len, inner);
     }
     zend_hash_str_update_ptr(inner, val + func_off, func_len, encoded);
   } else {
     if (len == 0) {
-      php_error_docref(NULL, E_WARNING, "pfx_meta: name must be non-empty");
+      php_error_docref(NULL, E_WARNING, "pfx_capture: name must be non-empty");
       return;
     }
-    zend_hash_update_ptr(&pfx_meta_fns, name, encoded);
+    zend_hash_update_ptr(&pfx_capture_fns, name, encoded);
   }
 }
 
@@ -820,7 +820,7 @@ static const zend_function_entry pfx_functions[] = {
   PHP_FE(pfx_start, arginfo_pfx_start)
   PHP_FE(pfx_stop, arginfo_pfx_stop)
   PHP_FE(pfx_abort, arginfo_pfx_abort)
-  PHP_FE(pfx_meta, arginfo_pfx_meta)
+  PHP_FE(pfx_capture, arginfo_pfx_capture)
   PHP_FE(pfx_set, arginfo_pfx_set)
   PHP_FE_END
 };
@@ -977,8 +977,8 @@ PHP_RINIT_FUNCTION(pfx) {
   pfx_initialized = false;
   pfx_aborted = false;
   atomic_store(&pfx_running, false);
-  zend_hash_init(&pfx_meta_fns, 32, NULL, NULL, 1);
-  zend_hash_init(&pfx_meta_methods, 8, NULL, pfx_meta_methods_dtor, 1);
+  zend_hash_init(&pfx_capture_fns, 32, NULL, NULL, 1);
+  zend_hash_init(&pfx_capture_methods, 8, NULL, pfx_capture_methods_dtor, 1);
   zend_hash_init(&pfx_request_data, 8, NULL, pfx_request_data_dtor, 1);
   zend_hash_init(&pfx_meta_strings, 32, NULL, NULL, 1);
   return SUCCESS;
@@ -989,8 +989,8 @@ PHP_RSHUTDOWN_FUNCTION(pfx) {
     pfx_stop();
   }
 
-  zend_hash_destroy(&pfx_meta_fns);
-  zend_hash_destroy(&pfx_meta_methods);
+  zend_hash_destroy(&pfx_capture_fns);
+  zend_hash_destroy(&pfx_capture_methods);
 
   if (!pfx_initialized) {
     zend_hash_destroy(&pfx_request_data);
