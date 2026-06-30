@@ -18,6 +18,7 @@
 
 #define PHP_PFX_VERSION "0.1.0"
 #define PFX_MAX_STACK 1024
+#define PFX_MAX_SPANS 8192
 
 // Low byte: arg position (1..N). Reserve 3..0xFF for future args.
 #define PFX_META_FIRST_ARG     1
@@ -34,26 +35,37 @@ static void pfx_stop(void);
 
 // ============================================================================
 // Types
-//
-// Frame identity is (fn, meta, prev). Cached display fields aren't part of
-// identity. meta is NULL or a string borrowed from arg[0] of a tracked call.
 // ============================================================================
 
 typedef struct {
   zend_function* fn;
   zend_string* meta;
   uint64_t prev;
-} pfx_key;
+} pfx_frame_key;
 
 typedef struct {
-  pfx_key key;                 // identity (24 bytes)
-  zend_string* class_name;     // addref'd; NULL if not a method
-  zend_string* function_name;  // addref'd; NULL for file-scope frames
-  zend_string* filename;       // addref'd; NULL for internal funcs
+  uint32_t leaf;
+  uint32_t span;
+} pfx_sample_key;
+
+typedef struct {
+  pfx_frame_key key;
+  zend_string* class_name;
+  zend_string* function_name;
+  zend_string* filename;
   uint32_t line;
 } pfx_frame;
 
-// Serialized frame record. String fields are 1-based indices (0 = absent).
+typedef struct {
+  zend_string* name;
+  zend_string* meta;
+  uint32_t parent;
+  uint32_t start;
+  uint32_t end;
+} pfx_span;
+
+// Output records
+
 typedef struct {
   uint32_t prev;
   uint32_t line;
@@ -62,6 +74,14 @@ typedef struct {
   uint32_t filename;
   uint32_t meta;
 } pfx_out_frame;
+
+typedef struct {
+  uint32_t name;
+  uint32_t meta;
+  uint32_t parent;
+  uint32_t start;
+  uint32_t end;
+} pfx_out_span;
 
 
 // ============================================================================
@@ -72,8 +92,14 @@ static pfx_frame* pfx_frames;
 static uint32_t pfx_n_frames;
 static uint32_t pfx_cap_frames;
 
-static HashTable pfx_frame_dedup;    // pfx_key bytes -> frame index
-static HashTable pfx_sample_counts;  // leaf frame idx -> u32* count
+static pfx_span* pfx_spans;
+static uint32_t pfx_n_spans;
+static uint32_t pfx_cap_spans;
+static uint32_t pfx_cur_span;
+static bool pfx_spans_capped; // PFX_MAX_SPANS reached
+
+static HashTable pfx_frame_dedup;   // pfx_frame_key bytes -> frame index
+static HashTable pfx_sample_counts; // pfx_sample_key bytes -> u32* count
 
 static uint64_t pfx_out_bytes;
 static uint64_t pfx_max_bytes;
@@ -83,15 +109,16 @@ static int pfx_timerfd = -1;
 static _Atomic uint32_t pfx_ticks;
 static _Atomic bool pfx_running;
 static uint64_t pfx_period_ns;
+static uint32_t pfx_ticks_total;
 
 static bool pfx_initialized;
 static bool pfx_aborted;
 
-static HashTable pfx_capture_fns;      // fn_name -> capture rule (PFX_META_*)
-static HashTable pfx_capture_methods;  // class_name -> (fn_name -> capture rule)
-static HashTable pfx_meta_strings;     // string -> string for interned meta strings
+static HashTable pfx_capture_fns;     // fn_name -> capture rule (PFX_META_*)
+static HashTable pfx_capture_methods; // class_name -> (fn_name -> capture rule)
+static HashTable pfx_meta_strings;    // string -> string for interned meta strings
 
-static HashTable pfx_request_data;  // key -> value strings set via pfx_set()
+static HashTable pfx_request_data; // key -> value strings set via pfx_set()
 
 static zend_atomic_bool* pfx_vm_interrupt_ptr;
 static void (*pfx_prev_interrupt_fn)(zend_execute_data*);
@@ -103,9 +130,6 @@ static char* pfx_secret;
 
 // ============================================================================
 // Meta capture
-//
-// Looks up ex->func in the user-registered tracked tables and returns the
-// meta string.
 // ============================================================================
 
 // Get an existing or new zend_string from bytes.
@@ -273,13 +297,10 @@ static zend_string* frame_meta(zend_execute_data* ex, zend_string* parent_meta) 
 
 // ============================================================================
 // Frame table
-//
-// Frames live in pfx_frames[], linked parent-ward via prev to form a call
-// tree. pfx_frame_dedup collapses repeat paths by (fn, meta, prev).
 // ============================================================================
 
 static uint32_t add_frame(zend_function* fn, zend_string* meta, uint32_t prev) {
-  pfx_key key;
+  pfx_frame_key key;
   key.fn = fn;
   key.meta = meta;
   key.prev = prev;
@@ -349,22 +370,20 @@ static uint32_t build_chain(zend_execute_data* ex, int depth) {
 }
 
 static void record_sample(uint32_t leaf, uint32_t count) {
-  uint32_t* c = zend_hash_index_find_ptr(&pfx_sample_counts, (zend_ulong)leaf);
+  pfx_sample_key key = { leaf, pfx_cur_span };
+  uint32_t* c = zend_hash_str_find_ptr(&pfx_sample_counts, (const char*)&key, sizeof(key));
   if (!c) {
     c = pemalloc(sizeof(*c), 1);
     *c = 0;
-    zend_hash_index_add_ptr(&pfx_sample_counts, (zend_ulong)leaf, c);
-    pfx_out_bytes += sizeof(uint32_t) + sizeof(uint32_t);  // leaf + count
+    zend_hash_str_add_ptr(&pfx_sample_counts, (const char*)&key, sizeof(key), c);
+    pfx_out_bytes += sizeof(pfx_sample_key) + sizeof(uint32_t);  // key + count
   }
   *c += count;
 }
 
 
 // ============================================================================
-// Sampling plumbing
-//
-// Tick thread reads the timerfd, bumps pfx_ticks, flags vm_interrupt. PHP's
-// main thread does the actual stack walk at the next opcode boundary.
+// Sampling
 // ============================================================================
 
 static void* pfx_tick_loop(void* arg) {
@@ -391,6 +410,7 @@ static void* pfx_tick_loop(void* arg) {
 static void pfx_interrupt_fn(zend_execute_data* ex) {
   if (atomic_load(&pfx_running)) {
     uint32_t n = atomic_exchange(&pfx_ticks, 0);
+    pfx_ticks_total += n;
     if (n > 0 && ex) {
       uint32_t leaf = build_chain(ex, 0);
       if (leaf) {
@@ -443,7 +463,7 @@ static void pfx_request_data_dtor(zval* z) {
 
 
 // ============================================================================
-// Request-scoped setup / teardown
+// Setup / teardown
 // ============================================================================
 
 static void pfx_init_state(void) {
@@ -451,10 +471,18 @@ static void pfx_init_state(void) {
     return;
   }
 
+  pfx_ticks_total = 0;
+  pfx_out_bytes = 0;
+
   pfx_frames = NULL;
   pfx_n_frames = 0;
   pfx_cap_frames = 0;
-  pfx_out_bytes = 0;
+
+  pfx_spans = NULL;
+  pfx_n_spans = 0;
+  pfx_cap_spans = 0;
+  pfx_cur_span = 0;
+  pfx_spans_capped = false;
 
   zend_hash_init(&pfx_frame_dedup, 256, NULL, NULL, 1);
   zend_hash_init(&pfx_sample_counts, 256, NULL, pfx_count_dtor, 1);
@@ -468,6 +496,12 @@ static void pfx_stop(void) {
   }
 
   atomic_store(&pfx_running, false);
+
+  // Close any open spans.
+  for (uint32_t s = pfx_cur_span; s != 0; s = pfx_spans[s].parent) {
+    pfx_spans[s].end = pfx_ticks_total;
+  }
+  pfx_cur_span = 0;
 
   // Force an immediate tick so the tick thread's blocking read() returns.
   struct itimerspec now = {
@@ -495,7 +529,7 @@ static void pfx_atfork_child(void) {
 // ============================================================================
 // Binary output
 //
-//   magic        : 4 bytes "PFX0"
+//   magic        : 4 bytes "PFX1"
 //   period_ns    : u64
 //   uid          : u32
 //   gid          : u32
@@ -506,11 +540,13 @@ static void pfx_atfork_child(void) {
 //   n_frames     : u32
 //   frames[]     : pfx_out_frame  (prev, line, class, function, filename, meta)
 //   n_samples    : u32
-//   samples[]    : { u32 leaf; u32 count }
-//   end_magic    : 4 bytes "END0"
+//   samples[]    : { u32 leaf; u32 span; u32 count }
+//   n_spans      : u32
+//   spans[]      : pfx_out_span   (name, meta, parent, start, end)
+//   end_magic    : 4 bytes "END1"
 // ============================================================================
 
-// 1-based index of s in strings, inserting it if new. 0 if s is NULL.
+// 1-based index of s in strings
 static uint32_t string_idx(HashTable* strings, zend_string* s) {
   if (!s) return 0;
   uintptr_t existing = (uintptr_t)zend_hash_find_ptr(strings, s);
@@ -521,13 +557,23 @@ static uint32_t string_idx(HashTable* strings, zend_string* s) {
 }
 
 static bool emit_binary(FILE* out) {
-  pfx_out_frame* records = malloc(pfx_n_frames * sizeof(*records));
-  if (!records) {
+  pfx_out_frame* frames = malloc(pfx_n_frames * sizeof(*frames));
+  if (!frames) {
     php_error_docref(NULL, E_WARNING, "pfx: out of memory encoding profile");
     return false;
   }
 
-  fwrite("PFX0", 4, 1, out);
+  pfx_out_span* spans = NULL;
+  if (pfx_n_spans > 0) {
+    spans = malloc(pfx_n_spans * sizeof(*spans));
+    if (!spans) {
+      php_error_docref(NULL, E_WARNING, "pfx: out of memory encoding profile");
+      free(frames);
+      return false;
+    }
+  }
+
+  fwrite("PFX1", 4, 1, out);
 
   fwrite(&pfx_period_ns, sizeof(pfx_period_ns), 1, out);
 
@@ -557,45 +603,68 @@ static bool emit_binary(FILE* out) {
 
   for (uint32_t i = 1; i <= pfx_n_frames; i++) {
     pfx_frame* f = &pfx_frames[i];
-    pfx_out_frame* record = &records[i - 1];
+    pfx_out_frame* rec = &frames[i - 1];
 
-    record->prev = f->key.prev;
-    record->line = f->line;
-    record->class = string_idx(&strings, f->class_name);
-    record->function = string_idx(&strings, f->function_name);
-    record->filename = string_idx(&strings, f->filename);
-    record->meta = string_idx(&strings, f->key.meta);
+    rec->prev = f->key.prev;
+    rec->line = f->line;
+    rec->class = string_idx(&strings, f->class_name);
+    rec->function = string_idx(&strings, f->function_name);
+    rec->filename = string_idx(&strings, f->filename);
+    rec->meta = string_idx(&strings, f->key.meta);
+  }
+
+  for (uint32_t i = 1; i <= pfx_n_spans; i++) {
+    pfx_span* sp = &pfx_spans[i];
+    pfx_out_span* rec = &spans[i - 1];
+
+    rec->name = string_idx(&strings, sp->name);
+    rec->meta = string_idx(&strings, sp->meta);
+    rec->parent = sp->parent;
+    rec->start = sp->start;
+    rec->end = sp->end;
   }
 
   // Strings section.
   uint32_t n_strings = zend_hash_num_elements(&strings);
   fwrite(&n_strings, 4, 1, out);
-  zend_string* key;
-  ZEND_HASH_FOREACH_STR_KEY(&strings, key) {
-    uint32_t len = (uint32_t)ZSTR_LEN(key);
-    fwrite(&len, 4, 1, out);
-    fwrite(ZSTR_VAL(key), 1, len, out);
-  } ZEND_HASH_FOREACH_END();
+  {
+    zend_string* key;
+    ZEND_HASH_FOREACH_STR_KEY(&strings, key) {
+      uint32_t len = (uint32_t)ZSTR_LEN(key);
+      fwrite(&len, 4, 1, out);
+      fwrite(ZSTR_VAL(key), 1, len, out);
+    } ZEND_HASH_FOREACH_END();
+  }
 
   // Frames section.
   fwrite(&pfx_n_frames, 4, 1, out);
-  fwrite(records, sizeof(*records), pfx_n_frames, out);
+  fwrite(frames, sizeof(*frames), pfx_n_frames, out);
 
   // Samples section.
   uint32_t n_samples = zend_hash_num_elements(&pfx_sample_counts);
   fwrite(&n_samples, 4, 1, out);
-  zend_ulong leaf;
-  uint32_t* c;
-  ZEND_HASH_FOREACH_NUM_KEY_PTR(&pfx_sample_counts, leaf, c) {
-    uint32_t l = (uint32_t)leaf;
-    uint32_t count = *c;
-    fwrite(&l, 4, 1, out);
-    fwrite(&count, 4, 1, out);
-  } ZEND_HASH_FOREACH_END();
+  {
+    zend_string* key;
+    void* ptr;
+    ZEND_HASH_FOREACH_STR_KEY_PTR(&pfx_sample_counts, key, ptr) {
+      pfx_sample_key* sample_key = (pfx_sample_key*)ZSTR_VAL(key);
+      uint32_t* sample_count = (uint32_t*)ptr;
+      fwrite(&sample_key->leaf, 4, 1, out);
+      fwrite(&sample_key->span, 4, 1, out);
+      fwrite(sample_count, 4, 1, out);
+    } ZEND_HASH_FOREACH_END();
+  }
 
-  fwrite("END0", 4, 1, out);
+  // Spans section.
+  fwrite(&pfx_n_spans, 4, 1, out);
+  if (pfx_n_spans > 0) {
+    fwrite(spans, sizeof(*spans), pfx_n_spans, out);
+  }
 
-  free(records);
+  fwrite("END1", 4, 1, out);
+
+  free(frames);
+  free(spans);
   zend_hash_destroy(&strings);
 
   // ferror() catches any short write or stream error from any fwrite above,
@@ -634,6 +703,18 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_set, 0, 2, IS_VOID, 0)
   ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
   ZEND_ARG_TYPE_INFO(0, value, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_span_start, 0, 1, IS_VOID, 0)
+  ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_span_meta, 0, 1, IS_VOID, 0)
+  ZEND_ARG_TYPE_INFO(0, meta, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pfx_span_stop, 0, 1, IS_VOID, 0)
+  ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
 PHP_FUNCTION(pfx_start) {
@@ -816,12 +897,126 @@ PHP_FUNCTION(pfx_set) {
   zend_hash_add_ptr(&pfx_request_data, key, value);
 }
 
+PHP_FUNCTION(pfx_span_start) {
+  zend_string* name;
+
+  ZEND_PARSE_PARAMETERS_START(1, 1)
+    Z_PARAM_STR(name)
+  ZEND_PARSE_PARAMETERS_END();
+
+  if (!atomic_load(&pfx_running)) {
+    return;
+  }
+
+  if (pfx_n_spans >= PFX_MAX_SPANS) {
+    if (!pfx_spans_capped) {
+      pfx_spans_capped = true;
+      php_error_docref(NULL, E_WARNING,
+        "pfx_span_start: PFX_MAX_SPANS (%d) reached; span tracking stopped",
+        PFX_MAX_SPANS);
+    }
+    return;
+  }
+
+  if (pfx_n_spans + 1 >= pfx_cap_spans) {
+    uint32_t new_cap = pfx_cap_spans ? pfx_cap_spans * 2 : 64;
+    if (new_cap > PFX_MAX_SPANS + 1) {
+      new_cap = PFX_MAX_SPANS + 1;
+    }
+    pfx_span* new_spans = realloc(pfx_spans, new_cap * sizeof(pfx_span));
+    if (!new_spans) {
+      return;
+    }
+    pfx_spans = new_spans;
+    pfx_cap_spans = new_cap;
+  }
+
+  uint32_t idx = ++pfx_n_spans;
+  pfx_span* sp = &pfx_spans[idx];
+  zend_string_addref(name);
+  sp->name = name;
+  sp->parent = pfx_cur_span;
+  sp->start = pfx_ticks_total;
+  sp->end = pfx_ticks_total;
+  sp->meta = 0;
+  pfx_out_bytes += sizeof(pfx_out_span) + sizeof(uint32_t) + ZSTR_LEN(name);
+  pfx_cur_span = idx;
+}
+
+PHP_FUNCTION(pfx_span_meta) {
+  zend_string* meta;
+
+  ZEND_PARSE_PARAMETERS_START(1, 1)
+    Z_PARAM_STR(meta)
+  ZEND_PARSE_PARAMETERS_END();
+
+  if (!atomic_load(&pfx_running) || pfx_spans_capped) {
+    return;
+  }
+
+  if (pfx_cur_span == 0) {
+    php_error_docref(NULL, E_WARNING, "pfx_span_meta: no open span to annotate");
+    return;
+  }
+
+  // Annotate the innermost open span.
+  pfx_span* sp = &pfx_spans[pfx_cur_span];
+  if (sp->meta) {
+    php_error_docref(NULL, E_WARNING,
+      "pfx_span_meta: span '%s' already has metadata; overwriting",
+      ZSTR_VAL(sp->name));
+    pfx_out_bytes -= sizeof(uint32_t) + ZSTR_LEN(sp->meta);
+    zend_string_release(sp->meta);
+  }
+  zend_string_addref(meta);
+  sp->meta = meta;
+  pfx_out_bytes += sizeof(uint32_t) + ZSTR_LEN(meta);
+}
+
+PHP_FUNCTION(pfx_span_stop) {
+  zend_string* name;
+
+  ZEND_PARSE_PARAMETERS_START(1, 1)
+    Z_PARAM_STR(name)
+  ZEND_PARSE_PARAMETERS_END();
+
+  if (!atomic_load(&pfx_running) || pfx_spans_capped) {
+    return;
+  }
+
+  // Find the nearest open span with this name.
+  uint32_t s = pfx_cur_span;
+  while (s != 0 && !zend_string_equals(pfx_spans[s].name, name)) {
+    s = pfx_spans[s].parent;
+  }
+  if (s == 0) {
+    php_error_docref(NULL, E_WARNING,
+      "pfx_span_stop: no open span named '%s'", ZSTR_VAL(name));
+    return;
+  }
+
+  // Stopped an ancestor without stopping children.
+  while (pfx_cur_span != s) {
+    pfx_spans[pfx_cur_span].end = pfx_ticks_total;
+    php_error_docref(NULL, E_WARNING,
+      "pfx_span_stop('%s'): implicitly closed span '%s' left open inside it",
+      ZSTR_VAL(name), ZSTR_VAL(pfx_spans[pfx_cur_span].name));
+    pfx_cur_span = pfx_spans[pfx_cur_span].parent;
+  }
+
+  pfx_spans[s].end = pfx_ticks_total;
+  pfx_cur_span = pfx_spans[s].parent;
+}
+
 static const zend_function_entry pfx_functions[] = {
   PHP_FE(pfx_start, arginfo_pfx_start)
   PHP_FE(pfx_stop, arginfo_pfx_stop)
   PHP_FE(pfx_abort, arginfo_pfx_abort)
   PHP_FE(pfx_capture, arginfo_pfx_capture)
   PHP_FE(pfx_set, arginfo_pfx_set)
+  PHP_FE(pfx_span_start, arginfo_pfx_span_start)
+  PHP_FE(pfx_span_meta, arginfo_pfx_span_meta)
+  PHP_FE(pfx_span_stop, arginfo_pfx_span_stop)
   PHP_FE_END
 };
 
@@ -945,7 +1140,7 @@ PHP_MINIT_FUNCTION(pfx) {
   REGISTER_LONG_CONSTANT("PFX_META_NORMALIZE_SQL", PFX_META_NORMALIZE_SQL, CONST_CS | CONST_PERSISTENT);
   pthread_atfork(NULL, NULL, pfx_atfork_child);
 
-  // Read pfx.secret then blank the entry so userland's ini_get can't see it.
+  // Read pfx.secret then blank the entry so userland ini_get can't see it.
   const char* secret = INI_STR("pfx.secret");
   if (secret && *secret) {
     pfx_secret = pestrdup(secret, 1);
@@ -1035,6 +1230,19 @@ PHP_RSHUTDOWN_FUNCTION(pfx) {
   }
   pfx_n_frames = 0;
   pfx_cap_frames = 0;
+
+  for (uint32_t i = 1; i <= pfx_n_spans; i++) {
+    if (pfx_spans[i].name) zend_string_release(pfx_spans[i].name);
+    if (pfx_spans[i].meta) zend_string_release(pfx_spans[i].meta);
+  }
+  if (pfx_spans) {
+    free(pfx_spans);
+    pfx_spans = NULL;
+  }
+  pfx_n_spans = 0;
+  pfx_cap_spans = 0;
+  pfx_cur_span = 0;
+
   pfx_initialized = false;
 
   zend_hash_destroy(&pfx_meta_strings);

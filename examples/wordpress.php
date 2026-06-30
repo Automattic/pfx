@@ -87,6 +87,42 @@ function __pfx_init() {
 		pfx_set( 'response_code', $response_code );
 	} );
 
+	$pfx_span_hooks = array(
+		'muplugins_loaded',
+		'plugins_loaded',
+		'setup_theme',
+		'after_setup_theme',
+		'init',
+		'wp_loaded',
+		'template_redirect',
+		'wp_head',
+		'wp_footer',
+		'shutdown',
+	);
+
+	foreach ( $pfx_span_hooks as $pfx_span_hook ) {
+		$GLOBALS['wp_filter'][ $pfx_span_hook ][ PHP_INT_MIN ][] = array(
+			'function'      => function() use ( $pfx_span_hook ) { pfx_span_start( $pfx_span_hook ); },
+			'accepted_args' => 1,
+		);
+
+		$GLOBALS['wp_filter'][ $pfx_span_hook ][ PHP_INT_MAX ][] = array(
+			'function'      => function() use ( $pfx_span_hook ) { pfx_span_stop( $pfx_span_hook ); },
+			'accepted_args' => 1,
+		);
+	}
+
+	// Optional: add span to every wpdb query.
+	/* $GLOBALS['wp_filter']['query'][ PHP_INT_MAX ][] = array(
+		'function' => function( $query ) {
+			pfx_span_start( 'query' );
+			pfx_span_meta( $query );
+			pfx_span_stop( 'query' );
+			return $query;
+		},
+		'accepted_args' => 1,
+	); */
+
 	// Start profiling.
 	pfx_start();
 }
