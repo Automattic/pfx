@@ -1140,13 +1140,10 @@ PHP_MINIT_FUNCTION(pfx) {
   REGISTER_LONG_CONSTANT("PFX_META_NORMALIZE_SQL", PFX_META_NORMALIZE_SQL, CONST_CS | CONST_PERSISTENT);
   pthread_atfork(NULL, NULL, pfx_atfork_child);
 
-  // Read pfx.secret then blank the entry so userland ini_get can't see it.
+  // Read pfx.secret for the X-Pfx-Secret header.
   const char* secret = INI_STR("pfx.secret");
   if (secret && *secret) {
     pfx_secret = pestrdup(secret, 1);
-    zend_string* name = zend_string_init(ZEND_STRL("pfx.secret"), 1);
-    zend_alter_ini_entry_chars(name, "", 0, ZEND_INI_SYSTEM, ZEND_INI_STAGE_STARTUP);
-    zend_string_release(name);
   }
 
   return SUCCESS;
