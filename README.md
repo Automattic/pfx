@@ -131,11 +131,32 @@ state, which can be useful for profiling:
 Note that `pfx_set()` accepts strings only. Each key must be unique and will
 result in a warning if the same key is used more than once.
 
+## Spans
+
+Spans record a named timeline alongside the samples. Each sample is tagged with
+the span that was open when it was taken, so you can attribute time to request
+phases or units of work.
+
+    pfx_span_start( 'render' );
+    // ... work ...
+    pfx_span_stop( 'render' );
+
+Spans nest: a new span opens as a child of the currently open one, and
+`pfx_span_stop()` closes the nearest open span with the given name. Any spans
+left open at the end of the request are closed automatically.
+
+Use `pfx_span_meta()` to attach a metadata string (such as a query's SQL) to
+the innermost open span:
+
+    pfx_span_start( 'query' );
+    pfx_span_meta( $sql );
+    pfx_span_stop( 'query' );
+
 ## Output format
 
 The resulting profile uses the following format:
 
-    magic        : 4 bytes "PFX0"
+    magic        : 4 bytes "PFX1"
     period_ns    : u64
     uid          : u32
     gid          : u32
@@ -146,10 +167,12 @@ The resulting profile uses the following format:
     n_frames     : u32
     frames[]     : pfx_out_frame  (prev, line, class, function, filename, meta)
     n_samples    : u32
-    samples[]    : { u32 leaf; u32 count }
-    end_magic    : 4 bytes "END0"
+    samples[]    : { u32 leaf; u32 span; u32 count }
+    n_spans      : u32
+    spans[]      : pfx_out_span   (name, meta, parent, start, end)
+    end_magic    : 4 bytes "END1"
 
-The `magic` is always `PFX0` for this binary format.
+The `magic` is always `PFX1` for this binary format.
 
 The `period_ns` is the sampling period in nanoseconds.
 
@@ -168,8 +191,13 @@ frame can reference `strings` (1-based index, 0 for empty/missing) for class
 name, function name, etc. Each frame can also reference the caller frame by
 its 1-based index, with 0 being the root.
 
-The `samples` section references a 1-based index leaf frame, and the total
+The `samples` section references a 1-based index leaf frame, the 1-based index
+of the span that was open when the sample was taken (0 if none), and the total
 number of samples for that frame.
 
-The `end_magic` is always `END0` for this format, and can be used to determine
+The `spans` section contains every span recorded during the profile. Each span
+references `strings` for its name and metadata, the parent span by 1-based
+index (0 for a root span), and `start`/`end` offsets in sampling periods.
+
+The `end_magic` is always `END1` for this format, and can be used to determine
 whether the profile is complete.
