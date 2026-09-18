@@ -6,6 +6,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 #include "Zend/zend_extensions.h"
+#include "Zend/zend_generators.h"
 
 #include <curl/curl.h>
 #include <pthread.h>
@@ -204,7 +205,7 @@ static zend_string* frame_meta(zend_execute_data* ex, zend_string* parent_meta) 
   }
 
   zend_function* fn = ex->func;
-  if (!fn->common.function_name) {
+  if (!fn || !fn->common.function_name) {
     return NULL;
   }
 
@@ -362,6 +363,12 @@ static uint32_t add_frame(zend_function* fn, zend_string* meta, uint32_t prev) {
 static uint32_t build_chain(zend_execute_data* ex, int depth) {
   if (!ex || depth >= PFX_MAX_STACK) {
     return 0;
+  }
+  if (!ex->func) {
+    ex = zend_generator_check_placeholder_frame(ex);
+    if (!ex->func) {
+      return build_chain(ex->prev_execute_data, depth + 1);
+    }
   }
   uint32_t parent = build_chain(ex->prev_execute_data, depth + 1);
   zend_string* parent_meta = parent ? pfx_frames[parent].key.meta : NULL;
